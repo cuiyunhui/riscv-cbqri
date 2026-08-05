@@ -1,0 +1,691 @@
+= CBQRI Bandwidth Allocation Lifecycle and Budget Configuration
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status:: Discussion proposal
+Target:: A follow-on extension to CBQRI version 1.0
+Base specification:: https://github.com/riscv-non-isa/riscv-cbqri/releases/tag/v1.0[CBQRI version 1.0]
+Author:: Yunhui Cui
+
+== Introduction
+
+CBQRI version 1.0 defines a bandwidth allocation model in which software
+configures a reserved bandwidth allocation (`Rbwb`) for each unique `RCID` and
+access-type (`AT`) entry. The sum of the configured reserved bandwidth
+allocations must not exceed the controller-level `MRBWB` budget.
+
+Two lifecycle requirements are not covered by the current interface:
+
+. Software cannot release the reserved bandwidth held by an `RCID`/`AT` entry.
+  The minimum legal `Rbwb` value is 1, and the bandwidth allocation interface
+  has no operation that disables an entry.
+. Some platforms need firmware to select the effective `MRBWB` budget during
+  boot, after considering memory-controller characteristics, SoC topology,
+  platform policy, or training results.
+
+The first requirement affects operating systems that dynamically allocate and
+reuse `RCID` values. For example, an operating system resource-control group
+can be associated with an `RCID`. When the group is removed, the operating
+system stops assigning requests to that `RCID` and later reuses the identifier
+for a different group. Without a way to release the old allocation, an inactive
+`RCID` continues to consume at least one reserved bandwidth block.
+
+This limitation has also been raised independently by a CBQRI implementer in
+https://github.com/riscv-non-isa/riscv-cbqri/issues/56[CBQRI issue #56].
+
+This proposal introduces:
+
+* A defined zero-reservation state, represented by `Rbwb=0`.
+* A `DROP_LIMIT` operation that releases the reserved bandwidth of a unique
+  `RCID`/`AT` allocation while preserving the other allocation parameters.
+* An optional, one-shot `CONFIG_BUDGET` operation that allows firmware to
+  select the effective `MRBWB` value before operating-system handoff.
+* Capability bits that allow software to discover each optional function
+  without issuing a state-changing probe operation.
+
+This document is a discussion proposal. It does not modify the ratified CBQRI
+version 1.0 specification.
+
+== Goals
+
+The proposed extension has the following goals:
+
+* Allow software to release reserved bandwidth when an `RCID` is retired.
+* Allow a released `RCID` to remain eligible to compete for non-reserved or
+  unused bandwidth.
+* Prevent the bandwidth allocation interface from creating an entry that is
+  architecturally forbidden from using both reserved and non-reserved
+  bandwidth.
+* Preserve `Mweight`, `useShared`, and `sharedAT` when dropping a limit.
+* Allow firmware to select the effective controller-level reserved bandwidth
+  budget exactly once during boot.
+* Prevent `MRBWB` from changing after bandwidth allocation has begun.
+* Preserve compatibility with CBQRI version 1.0 software and hardware.
+
+== Non-goals
+
+This proposal does not:
+
+* Define the absolute bandwidth represented by a bandwidth block.
+* Define how firmware selects the desired `MRBWB` value.
+* Define a new privilege mode or a new hardware access-control mechanism for
+  CBQRI registers.
+* Define expiration or automatic reclamation of inactive `RCID` entries.
+* Define request dropping as a bandwidth allocation policy.
+* Restore all controller state to its reset state.
+
+== Existing CBQRI behavior
+
+CBQRI version 1.0 defines the following bandwidth allocation operations:
+
+[cols="2,1,5",options="header"]
+|===
+| Operation
+| Encoding
+| Description
+
+| `CONFIG_LIMIT`
+| 1
+| Establish a bandwidth allocation for an `RCID` and `AT`.
+
+| `READ_LIMIT`
+| 2
+| Read the configured allocation for an `RCID` and `AT`.
+
+| Reserved
+| 3-23
+| Reserved for future standard use.
+
+| Custom
+| 24-31
+| Designated for custom use.
+|===
+
+For a unique allocation entry, version 1.0 requires:
+
+----
+1 <= Rbwb <= MRBWB
+----
+
+The sum of the reserved bandwidth allocations must not exceed `MRBWB`.
+Consequently, every configured unique allocation consumes at least one unit of
+the controller's reserved bandwidth budget.
+
+The `Mweight` field controls competition for non-reserved or unused bandwidth.
+An `Mweight` value of 0 establishes a hard limit and does not permit the `RCID`
+to use non-reserved or unused bandwidth after its reserved allocation has been
+consumed.
+
+If `useShared=1`, the allocation entry is an alias for the unique allocation
+identified by `sharedAT`. The `Rbwb` and `Mweight` fields in the alias entry are
+ignored.
+
+== Proposed capability discovery
+
+This proposal defines a backward-compatible CBQRI version 1.1 bandwidth
+controller interface. A bandwidth controller implementing any function in this
+proposal reports `bc_capabilities.VER=0x11`.
+
+Software must use `VER` before interpreting fields introduced by this
+proposal. If `VER=0x10`, bits 29 and 30 remain `WPRI` as specified by CBQRI
+version 1.0 and must not be interpreted as capability bits.
+
+For `VER=0x11`, two independent read-only capability bits are proposed in bits
+that were reserved by version 1.0.
+
+[cols="1,2,5",options="header"]
+|===
+| Bit
+| Field
+| Description
+
+| 29
+| `RBWB0`
+| When 1, the controller supports the `Rbwb=0` semantics and the
+  `DROP_LIMIT` operation defined by this extension.
+
+| 30
+| `CBUDGET`
+| When 1, the controller supports the `CONFIG_BUDGET` operation defined by
+  this extension.
+|===
+
+The proposed bit positions are subject to allocation by the CBQRI Task Group.
+The two functions use separate bits so an implementation can support either
+function independently.
+
+When `RBWB0=0`:
+
+* A `CONFIG_LIMIT` operation requesting `Rbwb=0` for a unique allocation fails
+  with `STATUS=5`, as required by CBQRI version 1.0.
+* A `DROP_LIMIT` operation fails with `STATUS=2`.
+
+When `CBUDGET=0`, a `CONFIG_BUDGET` operation fails with `STATUS=2`.
+
+Capability discovery must not require software to attempt `CONFIG_BUDGET`,
+because a successful probe would consume the one permitted budget
+configuration.
+
+== Proposed bandwidth allocation operations
+
+The following operation encodings are proposed for `bc_alloc_ctl.OP`.
+
+[cols="2,1,5",options="header"]
+|===
+| Operation
+| Encoding
+| Description
+
+| `CONFIG_LIMIT`
+| 1
+| Establish a bandwidth allocation for an `RCID` and `AT`.
+
+| `READ_LIMIT`
+| 2
+| Read the configured allocation for an `RCID` and `AT`.
+
+| `DROP_LIMIT`
+| 3
+| Set the `Rbwb` of a unique allocation selected by `RCID` and `AT` to 0
+  without modifying its other allocation parameters.
+
+| `CONFIG_BUDGET`
+| 4
+| Set the effective controller-level `MRBWB` budget. This operation can
+  complete successfully at most once after reset and only before bandwidth
+  allocation state has been modified.
+
+| Reserved
+| 5-23
+| Reserved for future standard use.
+
+| Custom
+| 24-31
+| Designated for custom use.
+|===
+
+Operation encoding 3 in `bc_alloc_ctl` does not conflict with the
+`FLUSH_RCID` encoding in `cc_alloc_ctl`. Capacity allocation and bandwidth
+allocation operations are interpreted in separate operation spaces.
+
+== Zero-reservation semantics
+
+When `bc_capabilities.RBWB0=1`, `Rbwb=0` is a defined value for a unique
+allocation entry.
+
+The value 0 in `Rbwb` indicates that no bandwidth is reserved for requests that
+match the unique `RCID` and `AT` allocation entry. The entry contributes 0 to
+the controller's reserved bandwidth accounting.
+
+Requests that match an entry with `Rbwb=0` are not provided reserved bandwidth.
+They can compete for non-reserved or unused bandwidth according to the
+configured `Mweight`. Such requests are not guaranteed bandwidth when no
+non-reserved or unused bandwidth is available.
+
+For a unique allocation, the following combination is invalid:
+
+----
+useShared=0 && Rbwb=0 && Mweight=0
+----
+
+This combination would provide no reserved bandwidth and would also establish a
+hard limit that forbids the use of non-reserved or unused bandwidth. Bandwidth
+allocation is not intended to be an interface for denying all service to a
+requester.
+
+A `CONFIG_LIMIT` operation requesting this invalid combination fails with
+`STATUS=5` and does not modify the selected allocation entry.
+
+When `useShared=1`, the `Rbwb` and `Mweight` values in the alias entry remain
+ignored. Validation of the zero-reservation combination therefore applies only
+when `useShared=0`.
+
+A successful `READ_LIMIT` operation for a unique allocation configured with no
+reserved bandwidth writes 0 to `bc_bw_alloc.Rbwb`.
+
+=== Reserved bandwidth accounting
+
+For the purposes of checking the `MRBWB` limit, the total reserved bandwidth is
+the sum of `Rbwb` for all configured unique allocation entries:
+
+----
+TotalReserved =
+    sum(Rbwb for every configured RCID/AT entry where useShared=0)
+----
+
+An entry with `Rbwb=0` contributes 0 to this sum. An alias entry with
+`useShared=1` does not contribute a second time; its requests use the
+allocation of its `sharedAT` entry.
+
+An entry becomes configured when a `CONFIG_LIMIT` operation for that entry
+completes successfully. A successful `DROP_LIMIT` leaves the entry configured
+but changes its contribution to `TotalReserved` to 0. The controller's
+architectural reset allocation for `RCID=0` is not a software-configured entry
+for the purposes of this definition.
+
+A `CONFIG_LIMIT` operation that would make `TotalReserved` exceed the current
+effective `MRBWB` fails with `STATUS=5` and does not modify the selected entry.
+
+== `DROP_LIMIT` operation
+
+The `DROP_LIMIT` operation selects an allocation entry using
+`bc_alloc_ctl.RCID` and `bc_alloc_ctl.AT`. It does not use operands from
+`bc_bw_alloc`.
+
+On successful completion, `DROP_LIMIT`:
+
+* Sets the selected entry's `Rbwb` to 0.
+* Does not modify `Mweight`.
+* Does not modify `useShared`.
+* Does not modify `sharedAT`.
+* Releases the entry's reserved bandwidth from `TotalReserved`.
+
+The state change and release of reserved bandwidth take effect when the
+operation completes successfully.
+
+`DROP_LIMIT` is valid only when the selected entry has:
+
+----
+useShared=0 && Mweight!=0
+----
+
+If `useShared=1`, the operation fails with `STATUS=5`. Dropping an alias entry
+would not release bandwidth because requests matching the alias continue to
+use the allocation identified by `sharedAT`. Software must instead drop the
+unique allocation referenced by `sharedAT`.
+
+If the selected unique entry has `Mweight=0`, the operation fails with
+`STATUS=5`. Setting its `Rbwb` to 0 would produce the invalid no-service
+combination described above.
+
+If the selected entry already has `Rbwb=0`, `useShared=0`, and `Mweight!=0`,
+`DROP_LIMIT` succeeds without changing the entry. This makes the operation
+idempotent.
+
+When `DROP_LIMIT` fails, it does not modify the selected entry or reserved
+bandwidth accounting.
+
+=== Effect on shared access types
+
+Consider the following allocation:
+
+[cols="2,1,1,1,1",options="header"]
+|===
+| Entry
+| `Rbwb`
+| `Mweight`
+| `useShared`
+| `sharedAT`
+
+| `RCID=7, AT=0`
+| 8
+| 16
+| 0
+| N/A
+
+| `RCID=7, AT=1`
+| Ignored
+| Ignored
+| 1
+| 0
+|===
+
+Software drops this allocation by issuing `DROP_LIMIT` for `RCID=7, AT=0`.
+After successful completion, the unique entry has `Rbwb=0` and `Mweight=16`.
+Requests for both `AT=0` and the `AT=1` alias have no reserved bandwidth and
+compete for non-reserved or unused bandwidth using `Mweight=16`.
+
+A `DROP_LIMIT` operation for `RCID=7, AT=1` fails because `AT=1` is an alias.
+
+=== Why both `Rbwb=0` and `DROP_LIMIT` are defined
+
+Allowing `CONFIG_LIMIT` to program `Rbwb=0` is necessary because:
+
+* `READ_LIMIT` must report that an entry reserves no bandwidth.
+* Software might need to update `Mweight` while transitioning an entry to the
+  zero-reservation state.
+
+The explicit `DROP_LIMIT` operation is useful because it releases the
+reservation while preserving the entry's other configuration. Software does
+not need to perform a read-modify-write sequence to retain `Mweight`,
+`useShared`, and `sharedAT`.
+
+== `CONFIG_BUDGET` operation
+
+When `bc_capabilities.CBUDGET=1`, firmware can request a
+`CONFIG_BUDGET` operation before operating-system handoff.
+
+The desired budget is provided in `bc_bw_alloc.Rbwb`:
+
+----
+bc_bw_alloc.Rbwb = desired_mrbwb
+bc_alloc_ctl.OP  = CONFIG_BUDGET
+----
+
+The `RCID` and `AT` fields in `bc_alloc_ctl` are ignored by this operation.
+The `Mweight`, `useShared`, and `sharedAT` fields in `bc_bw_alloc` are also
+ignored.
+
+The requested value must satisfy:
+
+----
+1 <= desired_mrbwb <= NBWBLKS
+----
+
+If the requested value is outside this range, the operation fails with
+`STATUS=5`.
+
+On successful completion:
+
+* The effective reserved bandwidth budget is exactly `desired_mrbwb`.
+* `bc_capabilities.MRBWB` reports `desired_mrbwb`.
+* The effective `MRBWB` remains fixed until the controller is reset.
+
+The controller must not silently clamp a supported `CONFIG_BUDGET` request to
+a different value. If the requested value cannot be established, the operation
+fails with `STATUS=5` and `MRBWB` is not changed.
+
+=== Reset behavior
+
+If `CBUDGET=1`, the value of `bc_capabilities.MRBWB` following reset is
+`UNSPECIFIED`, but must satisfy:
+
+----
+1 <= MRBWB <= NBWBLKS
+----
+
+The reset value is the effective budget until a `CONFIG_BUDGET` operation
+completes successfully.
+
+Firmware that wants to retain the reset value but prevent a later agent from
+changing it can issue `CONFIG_BUDGET` with `desired_mrbwb` equal to the current
+`bc_capabilities.MRBWB` value.
+
+`CONFIG_BUDGET` does not configure a per-`RCID` allocation entry. Until a
+`CONFIG_LIMIT` operation completes successfully, the controller continues to
+provide the reset behavior required by CBQRI version 1.0: all available
+bandwidth is allocated to `RCID=0`, and requests with a nonzero `RCID` have
+`UNSPECIFIED` behavior.
+
+=== One-shot and ordering rules
+
+The controller tracks the following conceptual state after reset:
+
+* `budget_configured`: set by a successful `CONFIG_BUDGET`.
+* `allocation_modified`: set by a successful `CONFIG_LIMIT` or
+  `DROP_LIMIT`.
+
+Both conceptual state flags are clear following reset.
+
+A `CONFIG_BUDGET` operation is processed in the following order:
+
+. If `budget_configured` is set, the operation fails with `STATUS=6`.
+. Otherwise, if `allocation_modified` is set, the operation fails with
+  `STATUS=7`.
+. Otherwise, the requested `desired_mrbwb` is validated.
+. If the requested value is valid and can be established, the operation
+  succeeds and sets `budget_configured`.
+
+An unsuccessful operation does not change either conceptual state flag.
+A `READ_LIMIT` operation does not set `allocation_modified`.
+
+The ordering rules can be summarized as:
+
+----
+                             reset
+                               |
+               +---------------+---------------+
+               |                               |
+       CONFIG_BUDGET succeeds          CONFIG_LIMIT or
+               |                       DROP_LIMIT succeeds
+               v                               |
+       MRBWB fixed until reset                   v
+               |                       MRBWB fixed at its
+               |                       current reset value
+               v                               |
+     allocation operations allowed              v
+                                       CONFIG_BUDGET refused
+----
+
+These rules ensure that changing the controller-level budget cannot invalidate
+allocations already accepted against a previous `MRBWB` value.
+
+=== Firmware and privilege
+
+`CONFIG_BUDGET` uses the existing bandwidth allocation register interface. The
+operation itself does not identify the privilege mode of the requester and is
+not inherently restricted to M-mode.
+
+Before handoff, platform firmware should:
+
+. Restrict access to the CBQRI allocation interface using PMP, a platform
+  access-control mechanism, or another implementation-defined mechanism.
+. Select and configure the desired `MRBWB`.
+. Verify successful completion and read back `bc_capabilities.MRBWB`.
+. Expose the CBQRI allocation interface to the operating system.
+
+After a successful `CONFIG_BUDGET`, the one-shot rule prevents runtime firmware
+or operating-system software from changing `MRBWB` until reset.
+
+If firmware hands the controller to the operating system without executing
+`CONFIG_BUDGET`, the first successful allocation-modifying operation locks the
+current reset value of `MRBWB`.
+
+== Proposed status values
+
+The following `bc_alloc_ctl.STATUS` definitions are proposed.
+
+[cols="1,6",options="header"]
+|===
+| `STATUS`
+| Description
+
+| 0
+| Reserved.
+
+| 1
+| The operation completed successfully.
+
+| 2
+| An invalid or unsupported operation (`OP`) was requested.
+
+| 3
+| An operation was requested for an invalid `RCID`.
+
+| 4
+| An operation was requested for an invalid `AT`.
+
+| 5
+| An invalid or unsupported bandwidth allocation configuration or reserved
+  bandwidth budget was requested.
+
+| 6
+| A `CONFIG_BUDGET` operation was requested after a `CONFIG_BUDGET`
+  operation had already completed successfully since the last reset.
+
+| 7
+| A `CONFIG_BUDGET` operation was requested after a `CONFIG_LIMIT` or
+  `DROP_LIMIT` operation had completed successfully since the last reset.
+
+| 8-63
+| Reserved for future standard use.
+
+| 64-127
+| Designated for custom use.
+|===
+
+For `CONFIG_BUDGET`, status checks use the precedence defined in
+<<_one_shot_and_ordering_rules>>. This gives deterministic behavior if more
+than one error condition could apply.
+
+== Software lifecycle
+
+=== Firmware initialization
+
+Firmware can use the following sequence:
+
+. Read `bc_capabilities`.
+. If `CBUDGET=0`, treat the reported `MRBWB` as the fixed controller budget.
+. If `CBUDGET=1`, determine `desired_mrbwb`.
+. Write `desired_mrbwb` to `bc_bw_alloc.Rbwb`.
+. Issue `CONFIG_BUDGET`.
+. Poll `bc_alloc_ctl.BUSY` and verify `STATUS=1`.
+. Verify that `bc_capabilities.MRBWB` equals `desired_mrbwb`.
+. Hand the controller to the operating system.
+
+=== Creating an operating-system resource-control group
+
+Before assigning an `RCID` to a workload, the operating system configures every
+supported access type for that `RCID`. Each access type is configured either as
+a unique allocation or as an alias to a unique allocation.
+
+The operating system assigns the `RCID` to harts or devices only after all
+required `CONFIG_LIMIT` operations have completed successfully.
+
+=== Removing an operating-system resource-control group
+
+The operating system uses the following sequence:
+
+. Stop assigning the retiring `RCID` to harts and devices.
+. Account for implementation-specific synchronization needed for requests
+  already carrying the retiring `RCID`.
+. Issue `DROP_LIMIT` for each unique (`useShared=0`) allocation associated
+  with the `RCID`.
+. Do not issue `DROP_LIMIT` for alias (`useShared=1`) entries.
+. Return the `RCID` to the operating system's free identifier pool.
+
+Requests that still arrive with the retiring `RCID` after the drop can use
+non-reserved or unused bandwidth according to the preserved `Mweight`; they no
+longer consume reserved bandwidth budget.
+
+=== Reusing an `RCID`
+
+Before reassigning a released `RCID`, the operating system programs all of its
+unique and shared access-type entries for the new resource-control group.
+Only after the new configuration is complete does the operating system assign
+the `RCID` to harts or devices.
+
+== Error atomicity
+
+If `CONFIG_LIMIT`, `DROP_LIMIT`, or `CONFIG_BUDGET` fails:
+
+* The selected allocation entry is not modified.
+* The effective `MRBWB` is not modified.
+* Reserved bandwidth accounting is not modified.
+* The one-shot and allocation-modified state is not modified.
+
+These requirements allow software to recover from an error without reconstructing
+the controller state.
+
+== Compatibility
+
+=== Existing hardware
+
+CBQRI version 1.0 hardware reports `bc_capabilities.VER=0x10`. Software must
+ignore the proposed capability bit positions when `VER=0x10`, because those
+positions are `WPRI` in version 1.0.
+
+Existing hardware continues to reject `Rbwb=0` and does not need to implement
+the new operations. Software using this extension issues `DROP_LIMIT` or
+`CONFIG_BUDGET` only when `VER` identifies a specification version that defines
+the capability fields and the corresponding capability bit is 1.
+
+=== Existing software
+
+Existing CBQRI version 1.0 software does not request `Rbwb=0` and does not use
+operation encodings 3 or 4. It can continue to use a controller implementing
+this extension without modification.
+
+The extension does not change the behavior of allocations with:
+
+----
+1 <= Rbwb <= MRBWB
+----
+
+=== Virtualization
+
+A hypervisor can expose either capability independently to a guest. If a
+capability is exposed, the hypervisor must virtualize its state and operation
+ordering consistently with this proposal.
+
+A hypervisor is not required to expose `CONFIG_BUDGET` merely because the
+physical controller supports it. In a typical system, the physical budget is a
+platform-level property configured before guests run.
+
+== Alternatives considered
+
+=== Automatically reclaim inactive entries
+
+The controller could reclaim reservations after an implementation-defined
+period with no requests for an `RCID`. This makes allocation state dependent on
+an unspecified timeout and creates uncertainty when the `RCID` becomes active
+again. Explicit release provides deterministic software-visible behavior.
+
+=== Treat an inactive `RCID` as consuming no budget
+
+CBQRI validates the sum of `Rbwb` when `CONFIG_LIMIT` is issued. Software cannot
+reallocate an inactive entry's reserved budget to another entry unless the
+controller state is explicitly changed.
+
+=== Add a valid bit to every allocation entry
+
+A valid bit could distinguish configured and unconfigured entries, but it would
+require another field and would leave the behavior of `Mweight` and shared
+access types to be specified. Defining `Rbwb=0` preserves the existing entry
+and allocation parameters.
+
+=== Use only `CONFIG_LIMIT` with `Rbwb=0`
+
+This can represent the zero-reservation state, but requires software to provide
+all allocation fields again. `DROP_LIMIT` provides an explicit, idempotent
+release operation that preserves the existing configuration.
+
+=== Add a firmware-only MRBWB register
+
+A separate register would require a separate protection mechanism or MMIO page
+if access must be restricted to M-mode. It could also allow runtime firmware to
+change the budget after the operating system has established allocations.
+The one-shot operation avoids both problems without adding another register.
+
+== Open questions
+
+The following questions require agreement before normative specification text
+is prepared:
+
+. Should `RBWB0` and `CBUDGET` use the proposed bits 29 and 30, or other
+  capability bits allocated by the Task Group?
+. Should implementations supporting this proposal report `VER=0x11`, or should
+  the Task Group assign a different version or discovery mechanism?
+. Should `DROP_LIMIT` on an alias entry fail as proposed, or should the
+  operation be defined to act on its `sharedAT` target?
+. Should status values 6 and 7 remain distinct, or should they be combined
+  into one "operation not permitted in the current state" status?
+. Should a successful `DROP_LIMIT` lock out a later `CONFIG_BUDGET`, as
+  proposed for all allocation-modifying operations?
+. Does the proposed `TotalReserved` definition correctly capture the intended
+  accounting for unique per-`AT` allocations, or is the current version 1.0
+  wording intended to impose one aggregate reservation per `RCID`?
+. Should the zero-reservation lifecycle function and the budget configuration
+  function be published in one follow-on extension or as two independently
+  named extensions?
+. Which bandwidth-controller implementations require firmware-selected
+  `MRBWB`, and what platform inputs determine the selected value?
+
+== Proposed next steps
+
+. Review the entry lifecycle and `Rbwb=0` semantics independently from the
+  firmware budget use case.
+. Obtain feedback from bandwidth-controller implementers on support for a
+  non-reserved-only entry with `Rbwb=0` and `Mweight!=0`.
+. Resolve the open questions in this document.
+. Confirm with the CBQRI Task Group whether the work should use the existing
+  repository, a Task Group development branch, or a new follow-on extension
+  repository.
+. After semantic agreement, prepare a normative AsciiDoc patch and
+  implementation-oriented tests for:
+  ** `CONFIG_LIMIT -> DROP_LIMIT -> READ_LIMIT -> RCID reuse`
+  ** `RESET -> CONFIG_BUDGET -> CONFIG_LIMIT`
+  ** rejection of a second `CONFIG_BUDGET`
+  ** rejection of `CONFIG_BUDGET` after allocation modification
+  ** shared-access-type behavior
