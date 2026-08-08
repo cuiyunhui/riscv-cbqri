@@ -21,6 +21,19 @@ reported using these methods:
 * Constraints imposed by the controllers, such as the minimum number of capacity
   or bandwidth blocks per RCID.
 
+=== Retiring a Bandwidth Allocation
+
+When retiring an `RCID` that is no longer associated with a workload, software
+should stop assigning the `RCID` to new requests from harts and devices.
+Software should then configure the bandwidth allocation entry for every
+supported access-type of that `RCID` as inactive by using `CONFIG_LIMIT` with
+`Rbwb=0`, `Mweight=0`, and `useShared=0`.
+
+Software should wait for each `CONFIG_LIMIT` operation to complete successfully
+before returning the `RCID` to its free identifier pool. When an `RCID` is later
+reused, software should configure all required unique and shared access-type
+entries before assigning the `RCID` to new requests.
+
 === Context Switching QoS Identifiers
 
 Typically, the contents of the `srmcfg` CSR are updated with a new `RCID`

@@ -317,9 +317,9 @@ before requesting the operation.
 |===
 |Operation     | Encoding ^| Description
 |--            | 0         | Reserved for future standard use.
-|`CONFIG_LIMIT`| 1         | Establishes reserved bandwidth allocation for
-                             requests by `RCID` and of access-type `AT`. The
-                             bandwidth allocation is specified in `bc_bw_alloc`.
+|`CONFIG_LIMIT`| 1         | Configures the bandwidth allocation for requests by
+                             `RCID` and of access-type `AT`. The bandwidth
+                             allocation is specified in `bc_bw_alloc`.
 |`READ_LIMIT`  | 2         | Reads back the previously configured bandwidth
                              allocation for requests by `RCID` and of
                              access-type `AT`. The current configured allocation
@@ -370,19 +370,20 @@ the register. The `STATUS` field remains valid until a subsequent write to the
 [[BC_BMASK]]
 === Bandwidth Allocation Configuration
 
-The `bc_bw_alloc` is used to program reserved bandwidth blocks (`Rbwb`) for an
-`RCID` for requests of access-type `AT` using the `CONFIG_LIMIT` operation. If a
-controller does not support bandwidth allocation, then the `bc_bw_alloc` register
-is read-only zero.
+The `bc_bw_alloc` is used to program the bandwidth allocation for an `RCID` for
+requests of access-type `AT` using the `CONFIG_LIMIT` operation. If a controller
+does not support bandwidth allocation, then the `bc_bw_alloc` register is
+read-only zero.
 
-The `bc_bw_alloc` holds the previously configured reserved bandwidth blocks for
-an `RCID` and `AT` on successful completion of the `READ_LIMIT` operation.
+The `bc_bw_alloc` holds the previously configured bandwidth allocation for an
+`RCID` and `AT` on successful completion of the `READ_LIMIT` operation.
 
 Bandwidth is allocated in multiples of bandwidth blocks, and the value in `Rbwb`
-must be at least 1 and must not exceed `MRBWB` value. Otherwise, the `CONFIG_LIMIT`
-operation fails with `STATUS=5`. Additionally, the sum of `Rbwb` allocated
-across all `RCIDs` must not exceed `MRBWB` value, or the `CONFIG_LIMIT` operation
-fails with `STATUS=5`.
+must be between 0 and the `MRBWB` value, inclusive. Otherwise, the
+`CONFIG_LIMIT` operation fails with `STATUS=5`. Additionally, the sum of `Rbwb`
+allocated across all `RCIDs` must not exceed the `MRBWB` value, or the
+`CONFIG_LIMIT` operation fails with `STATUS=5`. An inactive entry, for which
+`Rbwb=0`, `Mweight=0`, and `useShared=0`, contributes 0 to this sum.
 
 .Bandwidth Allocation Configuration Register (`bc_bw_alloc`)
 [wavedrom, , ]
@@ -412,13 +413,29 @@ requests that match `AT`, even when all other `RCID` are using their full
 allocation of bandwidth. The bandwidth allocation scales linearly with the
 number of bandwidth blocks programmed into `Rbwb`.
 
+When `useShared=0`, an `Rbwb` value of 0 indicates that no bandwidth is reserved
+for requests that match the `RCID` and `AT`. If `Mweight` is nonzero, the entry
+remains active and requests matching the entry can compete for non-reserved or
+unused bandwidth according to `Mweight`.
+
+When `useShared=0`, `Rbwb=0`, and `Mweight=0`, the entry is inactive. An inactive
+entry is a configured allocation entry, but it reserves no bandwidth and does
+not participate in `Mweight`-based competition for non-reserved or unused
+bandwidth. The bandwidth provided to a request whose effective allocation is an
+inactive entry is `UNSPECIFIED`. However, the bandwidth controller must not
+prevent such a request from making forward progress.
+
+A successful `READ_LIMIT` operation for an inactive entry writes 0 to both
+`bc_bw_alloc.Rbwb` and `bc_bw_alloc.Mweight`. A subsequent successful
+`CONFIG_LIMIT` operation can configure the entry as active.
+
 If there is non-reserved or unused bandwidth available in an accounting
 interval, `RCIDs` may compete for additional bandwidth. The non-reserved or
 unused bandwidth is proportionately shared among the competing `RCIDs` by using the
 configured `Mweight` parameter, which is a number between 0 and 255. A larger
 weight implies a greater fraction of the bandwidth. A weight of 0 implies that
-the configured limit is a hard limit, and the use of unused or non-reserved
-bandwidth is not allowed.
+the configured `Rbwb` of an active entry is a hard limit, and the use of unused
+or non-reserved bandwidth is not allowed.
 
 Sharing of non-reserved bandwidth is not differentiated by access-type identifier.
 Therefore, the `Mweight` parameter must be programmed identically for all
