@@ -1,0 +1,174 @@
+= Fast-Track Proposal: CBQRI Bandwidth Inactive Entry
+
+This document requests approval to pursue the proposed CBQRI bandwidth
+inactive-entry extension through the Fast Track Architecture Extension
+process.
+
+== Fast-Track Proposer
+
+Proposer/Owner:: Yunhui Cui, ByteDance, cuiyunhui@bytedance.com
+Base specification:: https://github.com/riscv-non-isa/riscv-cbqri/releases/tag/v1.0[CBQRI version 1.0]
+
+== Introduction
+
+CBQRI version 1.0 configures a bandwidth-allocation entry for each resource
+control ID (`RCID`) and supported access-type (`AT`). A unique entry uses:
+
+* `Rbwb` for its reserved bandwidth blocks;
+* `Mweight` when competing for non-reserved or unused bandwidth; and
+* `useShared=0` to indicate that the entry does not share another
+  access-type's allocation.
+
+Version 1.0 requires:
+
+----
+1 <= Rbwb <= MRBWB
+----
+
+Because `Rbwb` must be at least 1, every configured unique allocation entry
+consumes at least one reserved bandwidth block. The sum of these reserved
+allocations must not exceed `MRBWB`.
+
+Operating systems dynamically create and remove resource-control groups. When
+a group is removed, software stops assigning its `RCID` and eventually returns
+the identifier to a free pool. CBQRI version 1.0 does not provide a state that
+releases all reserved bandwidth from the retired entry.
+
+This gap also affects a valid hard-limit entry with `Rbwb>0` and `Mweight=0`.
+Retiring that entry should not require software to assign a nonzero weight to
+a group that no longer exists.
+
+== Objectives
+
+The objectives are to:
+
+* define an inactive bandwidth-allocation entry that reserves no bandwidth;
+* use the existing `CONFIG_LIMIT` and `READ_LIMIT` operations;
+* permit deterministic retirement and reuse of an `RCID`; and
+* preserve all CBQRI version 1.0 configurations with `Rbwb>0`.
+
+== Proposed Extension
+
+=== Entry states
+
+For a unique allocation with `useShared=0`, the extension defines:
+
+[cols="1,1,4",options="header"]
+|===
+| `Rbwb`
+| `Mweight`
+| Entry state
+
+| greater than 0
+| greater than 0
+| Active entry with reserved bandwidth and weighted access to non-reserved or
+  unused bandwidth.
+
+| greater than 0
+| 0
+| Active hard-limit entry.
+
+| 0
+| greater than 0
+| Active non-reserved-only entry.
+
+| 0
+| 0
+| Inactive entry.
+|===
+
+The inactive state is therefore encoded as:
+
+----
+useShared = 0
+Rbwb      = 0
+Mweight   = 0
+----
+
+The `sharedAT` field has no effect when `useShared=0`. Existing
+`useShared=1` alias semantics are unchanged.
+
+The inactive state does not reinterpret any bandwidth-allocation encoding
+that is legal in CBQRI version 1.0, because version 1.0 does not permit
+`Rbwb=0`.
+
+=== Inactive-entry semantics
+
+An inactive entry:
+
+* reserves no bandwidth;
+* contributes 0 to the sum of reserved `Rbwb` allocations;
+* does not participate in `Mweight`-based competition for non-reserved or
+  unused bandwidth;
+* is reported by `READ_LIMIT` with `Rbwb=0`, `Mweight=0`, and `useShared=0`;
+  and
+* can be made active by a later successful `CONFIG_LIMIT` operation.
+
+The bandwidth provided to a request whose effective allocation is an inactive
+entry is `UNSPECIFIED`. However, the bandwidth controller must not prevent the
+request from making forward progress.
+
+=== Operation interface
+
+For a bandwidth controller supporting this extension, the legal `Rbwb` range
+for a unique allocation is:
+
+----
+0 <= Rbwb <= MRBWB
+----
+
+To make the selected `RCID` and `AT` entry inactive, software programs
+`bc_bw_alloc` with `Rbwb=0`, `Mweight=0`, and `useShared=0`, then issues
+`CONFIG_LIMIT` through `bc_alloc_ctl`. A successful `READ_LIMIT` reports the
+same values. Existing operation completion, status, and validation rules
+continue to apply.
+
+No new register or operation is required. `CONFIG_LIMIT` provides both
+`active -> inactive` and `inactive -> active` transitions.
+
+To retire an `RCID`, software configures the entry for every supported
+access-type as inactive and waits for successful completion before returning
+the identifier to its free pool.
+
+=== Discovery
+
+This proposal suggests using the existing `bc_capabilities.VER` field for
+discovery, with `0x11` as a candidate value. The final version assignment is
+subject to Architecture Review Committee confirmation.
+
+== Compatibility
+
+Existing CBQRI version 1.0 software does not configure `Rbwb=0`; its behavior
+is unchanged on a controller supporting this extension. All version 1.0
+configurations with `Rbwb>0` retain their existing semantics.
+
+Existing version 1.0 hardware need not implement the inactive state and can
+continue to reject `Rbwb=0`.
+
+== Exclusions
+
+This proposal does not:
+
+* modify the ratified CBQRI version 1.0 specification;
+* add a register or operation encoding;
+* change capacity-controller allocation semantics;
+* change bandwidth-monitoring semantics;
+* define the bandwidth represented by a bandwidth block;
+* define a bandwidth-arbitration algorithm.
+
+== Collaborations
+
+The initial proposal and inactive-entry semantics were discussed on the Data
+Center SIG mailing list:
+
+https://lists.riscv.org/g/sig-datacenter/topic/proposal_discussion_cbqri_bw/120373100
+
+== Request
+
+The proposer requests Architecture Review Committee approval to pursue the
+CBQRI bandwidth inactive-entry extension through the Fast Track process.
+
+== References
+
+* CBQRI version 1.0:
+  https://github.com/riscv-non-isa/riscv-cbqri/releases/tag/v1.0
