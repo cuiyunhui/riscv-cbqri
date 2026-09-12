@@ -1,0 +1,183 @@
+Subject: [RFC] CBQRI: decouple logical QoS IDs from controller resources
+To: sig-datacenter@lists.riscv.org
+
+Hello,
+
+I would like to start a discussion about a limitation that appears when CBQRI
+controllers in the same system implement different numbers of allocation
+entries or monitoring counters. This RFC first describes the problem and the
+required behavior, then presents sparse identifier mapping as a candidate
+solution. It is not yet a Fast-Track approval request.
+
+Background
+----------
+
+Ssqosid attaches one RCID and one MCID to a request. The same request IDs are
+then visible to multiple CBQRI controllers along the request path. CBQRI
+version 1.0 uses RCID to select an allocation entry and MCID to select a
+monitoring counter.
+
+Different controllers can need very different numbers of physical policies. A
+representative system might require:
+
+  Cache controller: 32 allocation entries
+  DDR controller:     8 allocation entries
+
+The cache may need 32 independently controlled workloads, while only a
+subset of those workloads needs a private DDR bandwidth policy. Nevertheless,
+the same request RCID reaches both controllers.
+
+Motivation
+----------
+
+Without an architectural mapping mechanism, there are two unattractive
+choices:
+
+1. Software limits the system-wide RCID space to 8, the smallest controller.
+   The cache then cannot use its remaining 24 entries.
+2. The DDR controller implements 32 directly indexed allocation entries even
+   though it needs only 8 simultaneous DDR policies. This wastes allocation
+   state and can also consume reserved bandwidth or other controller
+   resources.
+
+Silently truncating an RCID, using modulo arithmetic, or mapping all excess
+RCIDs to a nonzero entry is not sufficient. Those approaches can cause
+unrelated workloads to share a policy without software control.
+
+The monitoring side has the same issue. A system may need a large logical MCID
+namespace for monitor groups, while each controller implements only a small
+number of physical counters. Requiring one physical counter for every logical
+MCID defeats the purpose of a limited counter array.
+
+Required behavior
+-----------------
+
+The desired architecture should:
+
+  - preserve one logical request RCID and MCID across the system;
+  - allow each controller to implement its own smaller physical resource
+    count;
+  - let software explicitly decide which workloads receive private entries;
+  - provide a deterministic default policy for unmapped RCIDs;
+  - prevent unassigned MCIDs from aliasing another workload's counter;
+  - preserve independent RCID and MCID selection;
+  - work for CPU and IOMMU-originated requests; and
+  - remain compatible with software that uses the directly indexed range
+    reported by RQSC.
+
+Candidate design: sparse RCID mapping
+-------------------------------------
+
+Each nonzero internal RCID entry contains a valid bit and a 12-bit
+request-RCID tag. A matching tag selects that internal entry. A miss selects
+internal RCID 0, which is the default shared allocation.
+
+For example:
+
+  Request RCID 20 -> cache internal RCID 20
+                  -> DDR internal RCID 3, when explicitly mapped
+
+If request RCID 20 has no DDR mapping, it uses DDR internal RCID 0. Therefore,
+the cache can implement 32 entries while the DDR controller implements only 8.
+For an 8-entry DDR controller, RCID mapping adds seven 12-bit tags and seven
+valid bits instead of requiring 24 additional full bandwidth-allocation
+entries. Whether the lookup is implemented as parallel comparisons, a small
+CAM, a pipeline, or a shared ingress lookup is left to the implementation.
+
+Each controller adds one 64-bit RCID mapping-control register:
+
+  OP[4:0]
+  REQ_RCID[19:8]
+  INT_RCID[31:20]
+  STATUS[38:32]
+  BUSY[39]
+
+CONFIG_MAP binds or removes a mapping, and READ_MAP reads it. Mapping updates
+are atomic. The original request RCID continues downstream unchanged.
+
+Candidate design: sparse MCID binding
+-------------------------------------
+
+MCID mapping reuses the existing monitoring-control register; it does not add
+a second mapping register. Each physical counter has a valid bit and an
+effective-MCID tag.
+
+  CONFIG_EVENT(nonzero event): bind or reconfigure a counter
+  CONFIG_EVENT(None):          unbind and free the counter
+  READ_COUNTER(unassigned):    STATUS=No_counter, INV=1
+
+RCID and MCID remain independent in direct-monitoring mode. An unassigned MCID
+must not alias counter 0 or another workload's counter.
+
+Discovery and compatibility
+---------------------------
+
+The extension adds RCID_MAP and MCID_MAP capability bits to both capacity and
+bandwidth controllers. RQSC does not change:
+
+  RCID Count = number of internal allocation entries
+  MCID Count = number of physical monitoring counters
+
+Low-numbered RCIDs and MCIDs have equal-numbered reset mappings so existing
+software using only the RQSC-reported ranges continues to operate. New
+software uses the mapping behavior only after checking the extension version
+and capability bits.
+
+The RCID and MCID fields in IOMMU device contexts remain logical request
+identifiers. Each downstream controller performs its own local mapping.
+
+Proof of concept
+----------------
+
+A QEMU register-state and Linux software-lifecycle proof of concept has been
+prepared. It validates:
+
+  - capacity and bandwidth controller register behavior;
+  - 4096 logical RCIDs backed by four internal entries;
+  - independent exhaustion across controllers with different entry counts;
+  - 4096 logical MCIDs backed by two counters; and
+  - exhaustion, release, and reuse for both RCID and MCID mappings.
+
+All eight QEMU register tests and the QEMU/Linux end-to-end resctrl test pass.
+The version, capability-bit positions, and register offset used by the PoC are
+provisional.
+
+Alternatives considered
+-----------------------
+
+The following alternatives appear possible but have important tradeoffs:
+
+  - Limit logical RCIDs to the smallest controller: simple hardware, but
+    wastes larger controllers and preserves the original coupling.
+  - Implement a full request-ID-indexed mapping table: simple lookup, but a
+    complete 12-bit namespace requires 4096 mapping entries per controller.
+  - Restrict the platform to a smaller discoverable request-ID width: this may
+    reduce mapping cost, but introduces another platform-wide limit and
+    discovery requirement.
+  - Carry multiple controller-specific IDs in every request: removes the
+    local lookup, but expands Ssqosid, IOMMU contexts, and interconnect
+    sideband state.
+
+The sparse-tag design is proposed because its storage scales with the number
+of implemented allocation entries and counters, while retaining the complete
+logical request-ID namespace and the existing request format.
+
+Questions for the SIG
+---------------------
+
+1. Does the group agree that controllers should be able to implement different
+   physical RCID and MCID resource counts without reducing the system-wide
+   logical identifier space to the smallest controller?
+2. Is the sparse per-entry tag behavior an acceptable architectural interface,
+   while leaving the RTL lookup structure implementation-defined?
+3. Are there additional device/IOMMU or compatibility cases that should be
+   covered before requesting Fast-Track intake?
+
+A draft architectural proposal, normative text, and QEMU/Linux PoC are
+available. If the SIG agrees on the problem statement and general direction,
+I will revise the design based on feedback and then prepare the formal
+Fast-Track intake request.
+
+Best regards,
+Yunhui Cui
+ByteDance

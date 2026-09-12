@@ -1,0 +1,286 @@
+= Fast-Track Proposal: CBQRI Sparse Identifier Mapping
+
+This document requests approval to pursue the proposed CBQRI sparse identifier
+mapping extension through the Fast Track Architecture Extension process.
+
+== Fast-Track Proposer
+
+Proposer/Owner:: Yunhui Cui, ByteDance, cuiyunhui@bytedance.com
+Base specification:: https://github.com/riscv-non-isa/riscv-cbqri/releases/tag/v1.0[CBQRI version 1.0]
+
+== Introduction
+
+CBQRI version 1.0 uses an `RCID` to select an allocation entry and an `MCID`
+to select a monitoring counter. The number of supported identifiers is
+reported independently for each controller. A system can therefore contain,
+for example, a cache controller with 32 allocation entries and a memory
+bandwidth controller with 8 allocation entries. Software that assigns one
+system-wide `RCID` to a workload is constrained by the controller with the
+smallest allocation table, even when the other controllers have unused
+entries.
+
+The same coupling exists between the logical `MCID` namespace and the physical
+monitoring-counter array. Requiring one counter for every legal logical `MCID`
+either increases hardware cost or constrains the number of monitoring groups.
+Silently aliasing identifiers is not suitable because it changes allocation
+and monitoring semantics without software control.
+
+=== Concrete example and hardware benefit
+
+Consider a system in which a cache controller needs 32 simultaneously distinct
+allocation policies, while a DDR bandwidth controller needs only 8. Without an
+identifier-mapping mechanism, software must either limit the system-wide RCID
+space to 8 or the DDR controller must implement enough directly indexed
+allocation entries to accept all 32 request RCIDs.
+
+With this extension, the cache controller can retain 32 internal entries while
+the DDR controller implements 8. A workload carrying request `RCID=20` can
+select cache entry 20 and, only when it needs a private DDR policy, be mapped to
+DDR internal `RCID=3`. Request RCIDs without a private DDR mapping use DDR
+internal `RCID=0`.
+
+For the 8-entry DDR controller, the architectural state added by RCID mapping
+is seven 12-bit tags and seven valid bits. This replaces the need for 24
+additional full bandwidth-allocation entries in the example. The comparison
+logic has an implementation cost, but it does not eliminate the storage benefit
+when a full allocation entry is materially larger than its tag and when the
+number of simultaneously distinct DDR policies is smaller than the system-wide
+logical RCID space.
+
+The same principle applies to monitoring. A controller can expose the logical
+MCID namespace without implementing one physical counter for every logical
+MCID.
+
+== Objectives
+
+The objectives are to:
+
+* separate request `RCID` values from controller-internal allocation entries;
+* permit unbound request `RCID` values to use the default allocation entry;
+* separate logical `MCID` values from physical monitoring counters;
+* preserve independent `RCID` and `MCID` namespaces in direct-monitoring mode;
+* scale mapping storage with implemented allocation entries and counters, not
+  with the complete 12-bit identifier spaces; and
+* preserve operation by existing software on controllers implementing the
+  extension.
+
+== Proposed Extension
+
+=== RCID mapping
+
+A controller supporting `RCID_MAP` accepts the complete 12-bit request `RCID`
+space. Internal allocation entries remain numbered from 0 to the controller's
+reported `RCID Count` minus 1. Each nonzero internal entry contains a valid bit
+and a 12-bit request-`RCID` tag.
+
+For each incoming request, the controller compares the request `RCID` with the
+valid tags:
+
+* exactly one matching tag selects its internal `RCID`; and
+* no matching tag selects internal `RCID` 0.
+
+Internal `RCID` 0 is the default allocation and has no tag. Two nonzero
+internal entries must not contain the same valid request-`RCID` tag. Therefore,
+an explicitly mapped request `RCID` has a private allocation entry, while every
+unmapped request `RCID` shares the default allocation entry.
+An unbound nonzero internal entry can be configured in preparation for a
+binding, but it does not reserve or consume resources while unbound. A mapping
+operation fails if activating that entry would violate an allocation constraint
+such as `MRBWB`.
+
+Allocation-control operations address internal `RCID` values when `RCID_MAP`
+is implemented. The request `RCID` continues downstream unchanged. RCID
+mapping must not affect effective-`MCID` calculation.
+
+=== RCID mapping control
+
+Capacity and bandwidth controllers add one 64-bit register named
+`cc_rcid_map_ctl` and `bc_rcid_map_ctl`, respectively. The registers share this
+layout:
+
+[cols="1,2,5",options="header"]
+|===
+| Bits | Field | Description
+
+| 4:0
+| `OP`
+| Mapping operation.
+
+| 7:5
+| `WPRI`
+| Reserved for standard use.
+
+| 19:8
+| `REQ_RCID`
+| Request `RCID` whose mapping is operated on.
+
+| 31:20
+| `INT_RCID`
+| Internal allocation-entry identifier.
+
+| 38:32
+| `STATUS`
+| Operation completion status.
+
+| 39
+| `BUSY`
+| Operation-in-progress indication.
+
+| 63:40
+| `WPRI`
+| Reserved for standard use.
+|===
+
+The following operations are defined:
+
+[cols="2,1,5",options="header"]
+|===
+| Operation | Encoding | Description
+
+| `CONFIG_MAP`
+| 1
+| Bind `REQ_RCID` to nonzero `INT_RCID`. Specifying `INT_RCID=0` removes an
+  existing binding, after which the request `RCID` uses internal `RCID` 0.
+
+| `READ_MAP`
+| 2
+| Return the internal `RCID` bound to `REQ_RCID`; return 0 if it is unbound.
+|===
+
+A successful mapping update is atomic. When `BUSY` becomes 0, new requests use
+the new mapping and requests admitted with the old mapping no longer access
+the old internal allocation state. This permits software to reuse an unbound
+internal entry safely.
+
+The tag organization describes architectural behavior, not a required RTL
+microarchitecture. An implementation can use parallel comparisons, a small
+CAM, a pipelined lookup, or a mapping point shared by controllers behind a
+common ingress, provided that the externally visible selection, miss, atomicity,
+and propagation requirements are preserved.
+
+=== MCID mapping
+
+A controller supporting `MCID_MAP` associates each implemented physical
+monitoring counter with a valid bit and a 12-bit effective-`MCID` tag. The
+existing monitoring-control register remains the programming interface.
+
+For `CONFIG_EVENT` with a nonzero legal `EVT_ID`:
+
+* if the effective `MCID` is already assigned, that counter is reconfigured;
+* otherwise, a free physical counter is assigned and tagged with the effective
+  `MCID`; and
+* if no counter is free, the operation fails with `STATUS=6`.
+
+For `CONFIG_EVENT` with `EVT_ID=None`, an assigned counter is stopped, its tag
+is invalidated, and the counter becomes available for another effective
+`MCID`. The operation succeeds without effect when the effective `MCID` is not
+assigned.
+
+`READ_COUNTER` returns `STATUS=6` and a counter value with `INV=1` when the
+effective `MCID` is not assigned. Requests whose effective `MCID` does not
+match an assigned counter are not counted. They must not be accumulated into
+counter 0 or any other counter.
+
+In direct mode, the effective `MCID` is the request `MCID`, so logical `RCID`
+and `MCID` values remain freely combinable. In RCID-prefixed mode, the
+effective `MCID` is computed from the original request `RCID`, before RCID
+mapping, and the low `P` bits of the request `MCID`.
+
+=== Discovery and reported counts
+
+The extension defines `RCID_MAP` and `MCID_MAP` capability bits in both the
+capacity-controller and bandwidth-controller capability registers. The bits
+are valid only for a controller version assigned to this extension. The final
+version and bit assignments are subject to Architecture Review Committee
+confirmation.
+
+When `RCID_MAP=1`, the RQSC `RCID Count` remains the number of internal
+allocation entries. When `MCID_MAP=1`, the RQSC `MCID Count` remains the number
+of physical monitoring counters. The RQSC table format is unchanged.
+
+The only new programming register is the 64-bit RCID mapping-control register
+in each controller. MCID mapping reuses the existing monitoring-control
+register and its `CONFIG_EVENT` and `READ_COUNTER` operations.
+
+== Software Model
+
+Software can allocate logical request `RCID` and `MCID` values independently.
+A newly created resource-control group need not consume a private allocation
+entry in every controller: until a private entry is configured, its request
+`RCID` is unbound and uses internal `RCID` 0. Configuring a private allocation
+binds the request `RCID` to a free internal entry in that controller. If no
+entry is free, only that resource configuration fails.
+
+A monitoring group can exist without a physical counter in every controller.
+An unassigned event reports `Unassigned`; it must not return data accumulated
+for another logical `MCID`.
+
+The `RCID` and `MCID` carried in RISC-V IOMMU device contexts remain logical
+request identifiers. No IOMMU data-structure change is required by this
+extension.
+
+== Compatibility
+
+On reset, an RCID-mapping-capable controller binds request `RCID` values 1
+through `RCID Count-1` to the equal-numbered internal entries. Request `RCID`
+0 uses internal entry 0. Other request `RCID` values are unbound. This permits
+existing software, which uses only the RQSC-reported `RCID Count`, to continue
+to use direct, equal-numbered allocation entries.
+
+At reset, the physical counters are tagged with equal-numbered effective
+`MCID` values from 0 through `MCID Count-1`, and are stopped until configured.
+Existing software can therefore continue treating the RQSC-reported range as
+directly indexed. Mapping-aware software releases these reset bindings before
+assigning arbitrary logical `MCID` values. Up to the RQSC-reported `MCID Count`
+distinct effective `MCID` values can be assigned simultaneously.
+
+New software uses the extension only after validating both the controller
+version and the corresponding capability bit. On a version 1.0 controller, it
+continues to use the existing direct-indexed model.
+
+== Proof of Concept
+
+A QEMU and Linux proof of concept has been prepared for both capacity and
+bandwidth controllers. It validates:
+
+* 4096 logical request RCIDs backed by four internal allocation entries;
+* controller-local exhaustion and reuse of internal RCIDs;
+* independent allocation across controllers with different internal counts;
+* 4096 logical MCIDs backed by two physical counters;
+* `No_counter`, release, and reuse behavior.
+
+The QEMU register tests pass for both controller types, and a QEMU/Linux
+end-to-end resctrl test passes. The candidate version and capability-bit
+encodings used by the proof of concept are provisional.
+The normative draft separately specifies that IOMMU contexts continue to carry
+logical request RCIDs and MCIDs; the PoC does not model device traffic.
+
+== Exclusions
+
+This proposal does not:
+
+* change the RQSC table layout;
+* change the Ssqosid `srmcfg` register;
+* change the RISC-V IOMMU QoS-ID fields;
+* map an unassigned `MCID` to counter 0;
+* define monitoring-counter multiplexing or accumulation in software; or
+* modify the ratified CBQRI version 1.0 specification.
+
+== Collaborations
+
+This proposal is intended for initial discussion in the RISC-V Data Center
+SIG, following the same collaboration path used for the CBQRI bandwidth
+inactive-entry proposal. Feedback from the CBQRI Task Group and the sponsoring
+committee will be incorporated before Architecture Review Committee intake.
+
+== Request
+
+The proposer requests Architecture Review Committee approval to pursue the
+CBQRI sparse identifier mapping extension through the Fast Track process.
+
+== References
+
+* CBQRI version 1.0:
+  https://github.com/riscv-non-isa/riscv-cbqri/releases/tag/v1.0
+* Ssqosid version 1.0:
+  https://github.com/riscv/riscv-ssqosid/releases/tag/v1.0
