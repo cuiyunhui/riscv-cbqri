@@ -260,12 +260,16 @@ continues to use internal `RCID` 0 in that controller. An explicit request for
 a private configuration fails with a resource-exhaustion error and must not be
 reported as successfully applied.
 
-For an update spanning multiple controllers, privileged software should first
-verify that every required internal entry is available. It then reserves and
-programs the selected internal entries while they are unbound, and finally
-publishes the mappings with `CONFIG_MAP`. If preflight fails, none of the
-requested mappings are changed. This provides the following software-visible
-sequence:
+If a request `RCID` is already bound, software can update its current internal
+entry directly. This does not require another free entry and does not change
+the mapping.
+
+When an update needs to create mappings in one or more controllers, privileged
+software should first verify that every required internal entry is available.
+It then reserves and programs the selected internal entries while they are
+unbound, and finally publishes the mappings with `CONFIG_MAP`. If preflight
+fails, none of the requested mappings are changed. Creating a mapping therefore
+uses the following software-visible sequence:
 
 ....
 preflight -> reserve -> program -> publish

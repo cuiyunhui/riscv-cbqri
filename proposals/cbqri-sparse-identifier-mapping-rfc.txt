@@ -106,8 +106,11 @@ READ_LIMIT, and FLUSH_RCID use controller-internal RCID values.
 A newly created software control group initially uses internal RCID 0 and does
 not consume a private entry. If an explicit private configuration cannot
 reserve an entry, that configuration fails and the group continues to use the
-default entry in the affected controller. For an update spanning multiple
-controllers, software uses:
+default entry in the affected controller. If the request RCID is already
+bound, software updates its current internal entry directly without allocating
+another entry or changing the mapping.
+
+When an update needs to create mappings in multiple controllers, software uses:
 
   preflight -> reserve -> program -> publish
 
