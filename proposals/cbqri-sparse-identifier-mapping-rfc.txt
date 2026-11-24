@@ -1,4 +1,4 @@
-Subject: [RFC] CBQRI: decouple logical QoS IDs from controller resources
+Subject: [Discussion] CBQRI: decouple logical QoS IDs from controller resources
 To: sig-datacenter@lists.riscv.org
 
 Hello,
@@ -7,7 +7,7 @@ I would like to start a discussion about a limitation that appears when CBQRI
 controllers in the same system implement different numbers of allocation
 entries or monitoring counters. This RFC first describes the problem and the
 required behavior, then presents sparse identifier mapping as a candidate
-solution. It is not yet a Fast-Track approval request.
+solution for discussion.
 
 Background
 ----------
@@ -91,9 +91,27 @@ Each controller adds one 64-bit RCID mapping-control register:
   INT_RCID[31:20]
   STATUS[38:32]
   BUSY[39]
+  VALID[40]
 
-CONFIG_MAP binds or removes a mapping, and READ_MAP reads it. Mapping updates
-are atomic. The original request RCID continues downstream unchanged.
+CONFIG_MAP binds or removes a mapping. It fails with a distinct status if the
+selected internal RCID is already bound to a different request RCID. READ_MAP
+looks up an internal RCID by request RCID. READ_ENTRY looks up the tag and
+valid state of an internal entry, allowing software to recover the table by
+iterating over the physical entry count instead of all 4096 request RCIDs.
+
+Mapping updates are atomic. The original request RCID continues downstream
+unchanged. Request traffic always carries a logical RCID, while CONFIG_LIMIT,
+READ_LIMIT, and FLUSH_RCID use controller-internal RCID values.
+
+A newly created software control group initially uses internal RCID 0 and does
+not consume a private entry. If an explicit private configuration cannot
+reserve an entry, that configuration fails and the group continues to use the
+default entry in the affected controller. For an update spanning multiple
+controllers, software uses:
+
+  preflight -> reserve -> program -> publish
+
+If preflight fails, none of the requested mappings are changed.
 
 Candidate design: sparse MCID binding
 -------------------------------------
@@ -126,22 +144,6 @@ and capability bits.
 The RCID and MCID fields in IOMMU device contexts remain logical request
 identifiers. Each downstream controller performs its own local mapping.
 
-Proof of concept
-----------------
-
-A QEMU register-state and Linux software-lifecycle proof of concept has been
-prepared. It validates:
-
-  - capacity and bandwidth controller register behavior;
-  - 4096 logical RCIDs backed by four internal entries;
-  - independent exhaustion across controllers with different entry counts;
-  - 4096 logical MCIDs backed by two counters; and
-  - exhaustion, release, and reuse for both RCID and MCID mappings.
-
-All eight QEMU register tests and the QEMU/Linux end-to-end resctrl test pass.
-The version, capability-bit positions, and register offset used by the PoC are
-provisional.
-
 Alternatives considered
 -----------------------
 
@@ -170,13 +172,12 @@ Questions for the SIG
    logical identifier space to the smallest controller?
 2. Is the sparse per-entry tag behavior an acceptable architectural interface,
    while leaving the RTL lookup structure implementation-defined?
-3. Are there additional device/IOMMU or compatibility cases that should be
-   covered before requesting Fast-Track intake?
+3. Are there additional device, IOMMU, compatibility, or implementation-cost
+   considerations that should shape the design?
 
-A draft architectural proposal, normative text, and QEMU/Linux PoC are
-available. If the SIG agrees on the problem statement and general direction,
-I will revise the design based on feedback and then prepare the formal
-Fast-Track intake request.
+At this stage, I would like to confirm the problem statement and collect
+feedback on the candidate direction. A formal extension proposal can be
+prepared later if the group agrees that an architectural solution is needed.
 
 Best regards,
 Yunhui Cui

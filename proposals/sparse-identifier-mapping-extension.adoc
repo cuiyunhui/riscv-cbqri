@@ -88,9 +88,14 @@ binding, but it does not reserve or consume resources while unbound. A mapping
 operation fails if activating that entry would violate an allocation constraint
 such as `MRBWB`.
 
-Allocation-control operations address internal `RCID` values when `RCID_MAP`
-is implemented. The request `RCID` continues downstream unchanged. RCID
-mapping must not affect effective-`MCID` calculation.
+When `RCID_MAP` is implemented, the `RCID` operand of `CONFIG_LIMIT`,
+`READ_LIMIT`, and `FLUSH_RCID` identifies an internal `RCID`. A separate
+request/internal selector is not required: an `RCID` carried by a request is
+always a logical request `RCID`, while an `RCID` used by a controller-local
+allocation operation is always an internal `RCID`.
+
+The request `RCID` continues downstream unchanged. RCID mapping must not
+affect effective-`MCID` calculation.
 
 === RCID mapping control
 
@@ -126,7 +131,11 @@ layout:
 | `BUSY`
 | Operation-in-progress indication.
 
-| 63:40
+| 40
+| `VALID`
+| Read-only tag-valid result for `READ_ENTRY`.
+
+| 63:41
 | `WPRI`
 | Reserved for standard use.
 |===
@@ -145,6 +154,43 @@ The following operations are defined:
 | `READ_MAP`
 | 2
 | Return the internal `RCID` bound to `REQ_RCID`; return 0 if it is unbound.
+
+| `READ_ENTRY`
+| 3
+| Read the tag stored in `INT_RCID`. Return its tag in `REQ_RCID` and its
+  valid state in `VALID`. Internal `RCID` 0 returns `VALID=0`.
+|===
+
+`CONFIG_MAP` with a nonzero `INT_RCID` fails if that entry is already bound to
+a different request `RCID`. Repeating the existing binding is successful. If
+`REQ_RCID` is bound to another internal entry and the requested target is
+available, a successful operation atomically moves the binding and releases
+the old internal entry. `CONFIG_MAP` with `INT_RCID=0` removes the binding and
+succeeds without effect when no binding exists.
+
+The following status values are defined:
+
+[cols="1,5",options="header"]
+|===
+| Value | Meaning
+
+| 1
+| Success.
+
+| 2
+| Invalid or unsupported operation.
+
+| 3
+| Invalid request `RCID` mapping.
+
+| 4
+| Out-of-range internal `RCID`.
+
+| 5
+| The selected internal `RCID` is bound to a different request `RCID`.
+
+| 6
+| Activating the internal entry would violate an allocation constraint.
 |===
 
 A successful mapping update is atomic. When `BUSY` becomes 0, new requests use
@@ -209,7 +255,21 @@ A newly created resource-control group need not consume a private allocation
 entry in every controller: until a private entry is configured, its request
 `RCID` is unbound and uses internal `RCID` 0. Configuring a private allocation
 binds the request `RCID` to a free internal entry in that controller. If no
-entry is free, only that resource configuration fails.
+entry is free, group creation does not fail: the group remains valid and
+continues to use internal `RCID` 0 in that controller. An explicit request for
+a private configuration fails with a resource-exhaustion error and must not be
+reported as successfully applied.
+
+For an update spanning multiple controllers, privileged software should first
+verify that every required internal entry is available. It then reserves and
+programs the selected internal entries while they are unbound, and finally
+publishes the mappings with `CONFIG_MAP`. If preflight fails, none of the
+requested mappings are changed. This provides the following software-visible
+sequence:
+
+....
+preflight -> reserve -> program -> publish
+....
 
 A monitoring group can exist without a physical counter in every controller.
 An unassigned event reports `Unassigned`; it must not return data accumulated
@@ -218,6 +278,18 @@ for another logical `MCID`.
 The `RCID` and `MCID` carried in RISC-V IOMMU device contexts remain logical
 request identifiers. No IOMMU data-structure change is required by this
 extension.
+
+=== Mapping-table recovery
+
+Software can reconstruct the RCID mapping table by iterating over the
+controller's reported internal `RCID` count and issuing `READ_ENTRY` for each
+nonzero internal entry. This requires work proportional to the physical table
+size rather than probing all 4096 request `RCID` values with `READ_MAP`.
+
+Recovered valid entries must be treated as busy until software either adopts
+or explicitly removes their bindings. An entry whose ownership cannot be
+established must not be silently reused. Software may quarantine such an entry
+until a successful unbind or controller reset.
 
 == Compatibility
 
@@ -237,23 +309,6 @@ distinct effective `MCID` values can be assigned simultaneously.
 New software uses the extension only after validating both the controller
 version and the corresponding capability bit. On a version 1.0 controller, it
 continues to use the existing direct-indexed model.
-
-== Proof of Concept
-
-A QEMU and Linux proof of concept has been prepared for both capacity and
-bandwidth controllers. It validates:
-
-* 4096 logical request RCIDs backed by four internal allocation entries;
-* controller-local exhaustion and reuse of internal RCIDs;
-* independent allocation across controllers with different internal counts;
-* 4096 logical MCIDs backed by two physical counters;
-* `No_counter`, release, and reuse behavior.
-
-The QEMU register tests pass for both controller types, and a QEMU/Linux
-end-to-end resctrl test passes. The candidate version and capability-bit
-encodings used by the proof of concept are provisional.
-The normative draft separately specifies that IOMMU contexts continue to carry
-logical request RCIDs and MCIDs; the PoC does not model device traffic.
 
 == Exclusions
 
